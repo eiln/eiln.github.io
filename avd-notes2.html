@@ -1,0 +1,302 @@
+<!doctype html><html lang=en-us><head><meta name=viewport content="width=device-width,initial-scale=1"><meta charset=utf-8><meta name=robots content="noindex"><title>Apple Video Decoder Notes 2: To 4K Stream | Eileen Yoon</title>
+<link rel=stylesheet type=text/css href=https://eiln.net/css/style.min.css></head><body><div class=header><div class=name><a href=/>Eileen Yoon</a></div><div class=nav><a href=/ typeof="ListItem">Home</a>&nbsp;&nbsp;|&nbsp;&nbsp;<a href=/about.html>About</a>&nbsp;&nbsp;</div></div><div class=single><div class=title><h1>Apple Video Decoder Notes 2: To 4K Stream</h1></div><div class=date>Nov 23, 2023</div></div><p>How'd we get from a 128x64 red blob to&mldr;</p><video width=97% height=50% controls>
+<source src=/posts/11-23-2023-avd-notes2/11-16-2023-vp9-matrixbench-1080x512.mp4 type=video/mp4><p>Your browser doesn't support HTML video. Here is a
+<a href=/posts/11-23-2023-avd-notes2/11-16-2023-vp9-matrixbench-1080x512.mp4>link to the video</a> instead.</p></video><p>Sorry for the jump in progress, I've been too busy doing just that. We are long overdue for part two. As for H.264, we're streaming 4K no problem. H.264 High Profile I consider pretty solid now. If you noticed the file name, the demo above is actually decoding VP9. There's a few more loose ends to tie up before VP9 can too be "done", but, just as I got some RE progress, VP9 was officially declared end-of-life at "Scary Fast". Didn't even get a mention (their strict internal policy to call VP9 "Longhorn" may have something to do with this; this is specifically in contrast to how their codebases have no problem uttering the words <a href=https://en.wikipedia.org/wiki/MPEG_LA#H.264/MPEG-4_AVC_licensors>"AVC"</a>, <a href=https://en.wikipedia.org/wiki/MPEG_LA#HEVC_licensors>"HEVC"</a>, or <a href=https://en.wikipedia.org/wiki/Alliance_for_Open_Media>"AV1"</a>; but then again, some, but not all, of their userland drivers call the latter "Foghorn", I'm not kidding &mdash; perhaps a VP10 vestige). It also helps that the VP9 "spec" is literally copy-pasted libvpx C code, which very often contradicts the libvpx C code of today. Personally I'm not a fan of Google-scary-fast lifetimes, and I hope AV1 stays for good. More work (and hardware required) for me, regardless.</p><p>And the code:</p><pre><code><a href=https://github.com/eiln/avd>https://github.com/eiln/avd</a></code></pre><h2 id=intro>Intro</h2><p>Revisting the cryptic four-letter "logs" by CM3,</p><pre><code>[EMU] 454e6e49 00000001 6f636544 00000001 | InNE....Deco....
+[EMU] 72467453 00000001 32567453 00000001 | StFr....StV2....
+[EMU] 44707641 08800001 44707641 1100000d | AvpD....AvpD....
+[EMU] 44707641 22000012 44707641 42400004 | AvpD...&quot;AvpD..@B
+[EMU] 44707641 48000006 4e707041 00020000 | AvpD...HAppN....
+[EMU] 6e443256 00000000 6e567746 8febab74 | V2Dn....FwVnt...
+</code></pre><p>It was not so cryptic anymore upon seeing the VP9 equivalent, thanks to its distinctive codename.</p><pre><code>[EMU] 454e6e49 00000001 6f636544 00000001 | InNE....Deco....
+[EMU] 72467453 00000001 33567453 00000001 | StFr....StV3....
+[EMU] 4470764c 08800001 4470764c 11000019 | LvpD....LvpD....
+[EMU] 4470764c 21800018 4470764c 30000006 | LvpD...!LvpD...0
+[EMU] 4e70704c 00020000 6e443356 00000000 | LppN....V3Dn....
+[EMU] 6e567746 8febab74 00000000 00000000 | FwVnt...........
+</code></pre><p>Here's my best:</p><pre><code>Deco: Decode
+StFr: Start Frame
+StV2: Start Codec V2 (AVC)
+AvpD: AVC Vector/Variable-length/Video Processor/Parser
+AppN: AVC Prediction Processor
+V2Dn: Codec V2 Done
+FwVn: Firmware Version (8febab74)
+</code></pre><p>If you too were really curious on what the representative character for AV1 is (as an "A" is already claimed by AVC): it's "O", specifically OvpD/OppN/StV9/V9Dn. The "O" I suspect is from aOmedia. Naturally I wondered how "Longhorn" came to be. I'm guessing the project lead is a proud UT alum with a bumper sticker too.</p><h2 id=hardware-overview>Hardware Overview</h2><p>The AVD block consists of three (or four) stage 1 processors named "VP" &mdash; one of Vector/Variable-length/Video Processor/Parser, take your pick &mdash; one for each codec. The output of the VPs get muxed at the shared stage 2 Prediction Processor (PP) which implements common DSP routines like DCT/DSTs, motion compensation, loop filters, etc. Wouldn't want to waste silicon now. Restated, each supported codec has a dedicated VP that operates on the raw bitstream's macroblock, parses syntax and extracts necessary motion vectors and transform coefficients, and does whatever else it needs to do to prepare the raw bitstream into a codec-agnostic intermediate representation (IR) demanded by PP. <strong>PP is a shared suite of DSP routines will thus never see the raw bitstream, ever. It will only ever see the IR prepared by each VP.</strong> This makes VPs essentially helpers for generating the final instruction stream driving PP.</p><p>So if VP exists to handle the codec-specific quirks, do they do <em>everything</em>? They're capable of some bitstream parsing but not all, to no one's surprise. It's not easy writing a compliant bitstream parser in C (see the 880-page ITU-T H.264 spec manual), and a full-hardware implementation is not only near-impossible, it's just not worth it. One of Nvidia's video processors did have a much more ambitious H.264 sytax unit than that of AVD's, and while it definitely does more, "the hardware can only parse pred_weight_table and slice_data elements efficiently - the remaining parts of the slice NAL are supposed to be parsed by the firmware controlling the VLD in a semi-manual manner"<sup id=fnref:1><a href=#fn:1 class=footnote-ref role=doc-noteref>1</a></sup>. A full hardware solution is just not possible. Someone has to parse the headers and encode those fields in a way the hardware understands. Usually that's the job of the firmware, but we don't have one, meaning we get to do it.</p><h2 id=programmable>Programmable</h2><p>How would we tell the hardware "here's the prediction weights for L0 reference #0 luma component". Following the model of all the other media-related blocks found on Apple Sillion (APR/CSC/JPG/AVE/ANE/ISP)<sup id=fnref:2><a href=#fn:2 class=footnote-ref role=doc-noteref>2</a></sup>, there should be a dedicated MMIO register (a reserved slot in physical memory hooked up to the peripheral), which we'd write the weight factor value to, something like <code>write32(AVD_VP_H264_L0_0_LUMA_WEIGHTS, slice.luma_weight_l0[0])</code>. Repeat for whatever else information it needs to decode the frame. Once all the parameters are set, we'd press the big red "go" button, something like <code>write32(AVD_VP_H264_CTRL, 0x2b000000 | 7)</code>; that magic write would trigger the entire pre-defined "AVD decode sequence" (using the values stored in the registers to do the calculations, hence those specific locations are <em>memory-mapped</em>).</p><p>APR/CSC/JPG/AVE/ANE/ISP are what is <em>fixed-function</em> hardware, hardware that exposes a set of user-<em>configurable</em> parameters that could control pre-defined operations<sup id=fnref:3><a href=#fn:3 class=footnote-ref role=doc-noteref>3</a></sup> as opposed to user-<em>programmable</em> hardware, such as modern shader-capable GPUs that superceded the fixed-function graphics cards of, like, the 80s/90s. In practice, the former typically exposes its configuration states as MMIO registers that the driver can write to, whereas a shader pipeline would read and execute a program compiled in the processor's instruction set fetched from a flexible virtual address space. Programmable sounds better, but most of the media blocks above don't require the genericity of GPUs, that'd be overkill; things like the <a href=https://github.com/AsahiLinux/m1n1/blob/main/proxyclient/experiments/jpeg.py>JPEG block</a> (which R discovered was actually outsourced from some <a href="https://www.google.com/search?q=SHIKINO+KJN-7GI+0001">random Japanese vendor</a>), has a relatively simpler, well-defined task: all it needs is height/width/stride/chroma/input/output addresses <em>configured</em>, and those parameters + what it needs to do with those parameters never really changes.</p><p>Can AVD's parameters and tasks too be described statically? Let's see, H.264 has I-frames (intra-frames) which don't use references by definition, P-frames which use reflist0, B-frames (bi-directional) which use both reflist0 and reflist1, where reflist0/reflist1 can each have up to 16 references. We could use more registers up to AVD_VP_H264_L1_15_LUMA_WEIGHTS and AVD_VP_H264_L1_15_LUMA_OFFSET, and then AVD_VP_H264_L1_15_CB_WEIGHTS/OFFSET and AVD_VP_H264_L1_15_CR_WEIGHTS/OFFSET &mdash; we're at 192 32-bit registers already. And not all samples use weighted prediction, that's precisely what the H.264 bitstream spends a few extra bits encoding the <code>luma_weight_lX_flag[i]</code> and <code>chroma_weight_lX_flag[i]</code> for<sup id=fnref:4><a href=#fn:4 class=footnote-ref role=doc-noteref>4</a></sup>. It's starting to sound like this "weighted sample prediction process" is a <em>conditional</em> task which be executed dynamically, i.e. only upon given an opcode for "set luma weights" which takes the weight factor + reference index in its lower bits &mdash; or something like it.</p><pre style=max-height:1000px><code>if (use_pred_weights) {
+	luma_log_weight_denom;
+	if (chroma_format_idc != 0)
+		chroma_log_weight_denom;
+	for (i = 0; i <= num_ref_idx_l0_active_minus1; i++) {
+		luma_weight_flag_l0[i];
+		if (luma_weight_flag_l0[i]) {
+			luma_weight_l0[i];
+			luma_offset_l0[i];
+		}
+		if (chroma_format_idc != 0) {
+			chroma_weight_flag_l0[i];
+			if (chroma_weight_flag_l0[i]) {
+				for(j = 0; j < 2; j++) {
+					chroma_weight_l0[i][j];
+					chroma_offset_l0[i][j];
+				}
+			}
+		}
+	}
+	if (slice_type() == B) {
+		for (i = 0; i <= num_ref_idx_l1_active_minus1; i++) {
+			luma_weight_flag_l1[i];
+			if (luma_weight_flag_l1[i]) {
+				luma_weight_l1[i];
+				luma_offset_l1[i];
+			}
+			if (chroma_format_idc != 0) {
+				chroma_weight_flag_l1[i];
+				if (chroma_weight_flag_l1[i]) {
+					for(j = 0; j < 2; j++) {
+						chroma_weight_l1[i][j];
+						chroma_offset_l1[i][j];
+					}
+				}
+			}
+		}
+	}
+}
+</code></pre><p>AVD is <strong>programmable</strong>. It's not a generic compute unit, it uses an instruction set specialized for decoding video, it doesn't even have a mov (at least directly), but it is an instruction set and we have to RE it to get it to do anything. Specifically both VP/PP are programmable, but their roles differ. The PP instruction stream is what we want, and VP is essentially a helper tool that generates a portion of the PP instruction stream (the rest we have to) given the VP instruction stream. We don't have to use VP at all, but we obviously should.</p><pre><code>1. Write partial PP + VP instruction stream into VP FIFO
+2. VP completes PP instruction stream and DMA's it to IOMMU space
+3. PP executes final PP instruction stream fetched from IOMMU space
+</code></pre><p>Below is the "partial PP + VP" instruction stream i.e. what we have to RE. Example is for a really simple H.264 P-frame, the second frame actually. Relevant file is <a href=https://github.com/eiln/avd/blob/main/avid/h264/halv3.py><code>avid/h264/halv3.py</code></a>.</p><pre style=max-height:400px><code>[ 0] 0x2b000100 | cm3_cmd_inst_fifo_start
+[ 1] 0x2db012e0 | hdr_34_cmd_start_hdr
+[ 2]  0x1000000 | hdr_38_pixfmt
+[ 3]   0x3f007f | hdr_3c_height_width
+[ 4]        0x0 | cm3_dma_config_0
+[ 5]    0x7000f | hdr_28_height_width_shift3
+[ 6]  0x1002881 | hdr_2c_sps_param
+[ 7]   0x300000 | hdr_44_is_idr_mask
+[ 8]      0x3de | hdr_48_3de
+[ 9]   0x30000a | hdr_58_const_3a
+[10]  0x4020002 | cm3_dma_config_1
+[11]    0x20002 | cm3_dma_config_2
+[12]        0x0 | unk_12
+[13]     0x80c0 | hdr_9c_pps_tile_addr_lsb8[0]
+[14]  0x4020002 | cm3_dma_config_3
+[15]  0x4020002 | cm3_dma_config_4
+[16]        0x0 | unk_16
+[17]     0x8140 | hdr_9c_pps_tile_addr_lsb8[1]
+[18]     0x81c0 | hdr_9c_pps_tile_addr_lsb8[2]
+[19]     0x8240 | hdr_9c_pps_tile_addr_lsb8[3]
+[20]    0x70007 | cm3_dma_config_5
+[21]    0x107d0 | hdr_c0_curr_ref_addr_lsb7[0]
+[22]    0x10780 | hdr_c0_curr_ref_addr_lsb7[1]
+[23]    0x107fa | hdr_c0_curr_ref_addr_lsb7[2]
+[24]    0x107d2 | hdr_c0_curr_ref_addr_lsb7[3]
+[25]     0x73c1 | hdr_210_y_addr_lsb8
+[26]        0x8 | hdr_218_width_align
+[27]     0x73e1 | hdr_214_uv_addr_lsb8
+[28]        0x8 | hdr_21c_width_align
+[29]        0x0 | unk_29
+[30]   0x3f007f | hdr_54_height_width
+[31]  0x4020002 | cm3_dma_config_6
+[32]     0x82c0 | hdr_9c_pps_tile_addr_lsb8[7]
+[33]     0x75c0 | hdr_bc_sps_tile_addr_lsb8
+[34]    0x70007 | cm3_dma_config_7
+[35]    0x70007 | cm3_dma_config_8
+[36]    0x70007 | cm3_dma_config_9
+[37]    0x70007 | cm3_dma_config_a
+[38] 0x11000004 | hdr_d0_ref_hdr[0]
+[39]     0xe6d0 | hdr_110_ref0_addr_lsb7[0]
+[40]     0xe680 | hdr_150_ref1_addr_lsb7[0]
+[41]     0xe6fa | hdr_190_ref2_addr_lsb7[0]
+[42]     0xe6d2 | hdr_1d0_ref3_addr_lsb7[0]
+[43] 0x11000002 | hdr_d0_ref_hdr[1]
+[44]    0x106d0 | hdr_110_ref0_addr_lsb7[1]
+[45]    0x10680 | hdr_150_ref1_addr_lsb7[1]
+[46]    0x106fa | hdr_190_ref2_addr_lsb7[1]
+[47]    0x106d2 | hdr_1d0_ref3_addr_lsb7[1]
+[48]        0x0 | unk_48
+[49] 0x2d800000 | slc_a7c_cmd_d8
+[50]   0x74400d | inp_8b4d4_slice_addr_low
+[51]       0x36 | inp_8b4d8_slice_hdr_size
+[52] 0x2c000000 | cm3_cmd_exec_vp_mb
+[53] 0x2d904000 | slc_a70_cmd_slice_qpy
+[54] 0x2da30000 | slc_a74_cmd_a3
+[55] 0x2dc00001 | slc_6e8_cmd_ref_list_0[0]
+[56] 0x2dc00011 | slc_6e8_cmd_ref_list_0[1]
+[57] 0x2dc00020 | slc_6e8_cmd_ref_list_0[2]
+[58] 0x2dd00040 | slc_76c_cmd_weights_denom
+[59] 0x2de04201 | slc_770_cmd_weights_weights[0]
+[60] 0x2df0ffff | slc_8f0_cmd_weights_offsets[0]
+[61] 0x2a000000 | cm3_cmd_set_mb_dims
+[62]     0x3007 | cm3_mb_dims
+[63] 0x2d011000 | slc_6e4_cmd_ref_type
+[64] 0x2b000400 | cm3_cmd_inst_fifo_end
+</code></pre><h2 id=fifo>FIFO</h2><p>Before we can even get to the contents of the instruction stream, we have a much more rudimentary problem of how to feed the hardware an arbitrarily-long stream. Recall from the last post, "good things happen if we keep on banging this same register". For the VPs specifically, the engineers decided on a FIFO circuitry, and that's precisely how they work. When VP processes incoming u32, u32-by-u32, the processing of the current u32 can't depend on the next u32 being in memory: so they gave it a tiny instruction cache window. It also has a hidden internal state/storage to accumulate whatever VP produces either until given a C-string style "FIFO end" opcode or the instruction cache forcibly rolls over. Once given the FIFO end marker (forcibly or not), it will unconditionally DMA over whatever's accumulated in its state to virtual/IOMMU space, specifically the iova (IOMMU virtual address) stored at register AVD_VP_INSN_FIFO_IOVA; IOMMU space, exactly where PP expects its instruction stream to be at.</p><pre><code>#define AVD_VP_INSN_FIFO_265 0x1104004
+#define AVD_VP_INSN_FIFO_264 0x110400c
+#define AVD_VP_INSN_FIFO_VP9 0x1104010
+</code></pre><p>Neat, we're down to three registers. SIDETRACK, I immediately noticed two things were off. First, 265 precedes 264 (265 is HvpD/HppN/StV0/V0Dn) both in internal version number (V0/V2) and the FIFO location (0x4/0xc), but what's <em>really</em> weird is the jump in between 265 and 264 (missing V1/0x1104008). The V0/V2 version number jump is whatever, e.g. AV1 is all the way up at V9, but what's really weird is the corresponding jump in register offset too, i.e. there exists an unused hardware register physically located at 0x1104008. To demonstrate how the VP FIFO works,</p><pre><code>AVD_VP_INSN_FIFO_VCV1 = 0x1104008
+insn_fifo_idx = 0; insn_fifo_iova = 0x4000
+
+avd.ioalloc_at(0x0, 0x8000, stream=0)
+avd.iomon.add(0x0, 0x8000, &quot;dart0-space&quot;); avd.iomon.poll()
+
+avd_w32(0x1104068 + (insn_fifo_idx * 0x4), insn_fifo_iova &gt;&gt; 8)
+avd_w32(0x1104084 + (insn_fifo_idx * 0x4), 0x100000)
+avd_w32(AVD_VP_INSN_FIFO_VCV1, 0x2b000100 | (insn_fifo_idx * 0x10))
+for x in range(128):
+	avd_w32(AVD_VP_INSN_FIFO_VCV1, 0xdead0000 | x)
+avd.iomon.poll()
+</code></pre><p>Nothing happens up to iteration 127. Only when the 128th word is written, the accumulated internal state is DMA'd over all at once to IOMMU space.</p><pre><code>00004000: dead0000 dead0001 dead0002 dead0003 dead0004 dead0005 dead0006 dead0007
+00004020: dead0008 dead0009 dead000a dead000b dead000c dead000d dead000e dead000f
+00004040: dead0010 dead0011 dead0012 dead0013 dead0014 dead0015 dead0016 dead0017
+00004060: dead0018 dead0019 dead001a dead001b dead001c dead001d dead001e dead001f
+...
+000041c0: dead0070 dead0071 dead0072 dead0073 dead0074 dead0075 dead0076 dead0077
+000041e0: dead0078 dead0079 dead007a dead007b dead007c dead007d dead007e dead007f
+</code></pre><p>deadbeef is just a random value, but it also happens to <em>not</em> be a VP opcode, meaning it's a no-op that passes through and instead the written word itself gets accumulated to its state. This pass-through will make more sense later. For now, we're just telling it to accumulate dead0000 to dead007f. And the number 128 is because that's the instruction cache size, i.e. that's where it rolls over and VP unconditionally has to DMA over whatever's left in its state. This is all entirely expected behavior. <strong>Of a <em>functional</em> VP. This processor isn't supposed to exist.</strong> Isn't this really, really interesting now.</p><p>So, there's absolutely nothing in the driver/firmware <code>strings</code> that alludes to this mystery video codec "V1" codec by name, so we don't even a single character to go off of. I'll admit I kicked up ghidra specifically for this purpose (I literally don't need to; I have this all figured out, hence I'm doing this kind of stuff), but I feel like my specific case is pretty justified here. The only evidence I could find alluding to the existence of this "V1" codec is that the CM3 firmware function which writes the u32s into the respective VP FIFOs is a switch case, and the case for <code>0x1104008</code> <em>exists</em>, but it's guarded under an unreachable codepath, <code>0xfffffff</code>.</p><p><a href=/posts/11-23-2023-avd-notes2/ghidra.png target=_blank><img src=/posts/11-23-2023-avd-notes2/ghidra.png class=center></a></p><p>Yes the disassembly is this fucking bad. Not only are all the symbols stripped to hell, CM3 not having a memory management unit, all the SRAM "virtual" offsets are all fucking hardcoded. This utter badness what I was trying to articulate in the last post. Note that ghidra might be broken (it's already kinda broken in the "BYTE" block above the <code>0x1104004</code> case because of Thumb2 stuff, I think) also because <code>0x1104004</code> is N/A'd out too via <code>0xffffffe</code>, but, recall, H.265 VP FIFO is <code>0x1104004</code>. BUT what's important is that the case for <code>0x1104008</code> EXISTS! And the <code>0x1104008</code> FIFO ACTUALLY <strong>WORKS!!!</strong></p><p>Now now now now, this doesn't mean that we're gonna one-up macOS and support decode of whatever this mystery video codec V1 is. The following won't make much sense as I haven't talked about it yet, come back and re-read it if you care. All we know is that VCV1 does have its own VP (this VP being incompatible with the instructions/bitstreams of H.264/H.265/VP9, I tried), and that its VP is at least capable of its PT1 duties, i.e. executing the header marker and DMA-ing over the accumulated state; even if its VP is fully functional, i.e. it can do its PT2 duties i.e. it can parse macroblocks and derive transform coefficients + motion vectors from the bitstream (unlikely, but it could be partially fused-off), its output would be useless if there's no support at the stage 2 prediction processor; that is, if VCV1 demands more intra/transform/invquant/mc/lf/etc features than what is already present and covered by the other three codecs. We have <em>no</em> macOS "reference" implementation ("reference" not that it's documented, but at least it's a blackbox function we can put in something and get something out of). Unless they abrubtly decide to resurrect VCV1 sometime soon, every single bit fed into it (about ~3000) would have to be completely guessed (as if RE-ing with the output side-by-side has been easy, at all), and the probability of that thing ever realizing to a shippable/spec-compliant state is near zero, as likely as them resurrecting VCV1. But it's not like I'm not gonna try ;).</p><p>To demonstrate that I have learned nothing from a mindless wording on my part in the third sentence of the last blog post leading to some dude spreading misinformation on /r/av1 citing the very blog post and the blog owner, by full government name, as source, I will do the guessing game anew. Reason: we're much further down this time. The AVD I've been talking about is their first (correct me) in-house video decode IP (Intel Macs shipped with Imagination's IP named DX-something). My completely made-up, bullshitted guess is that their new in-house IP started off as a HEVC/HEIF block &mdash; H.265 we all know Apple has <a href=https://en.wikipedia.org/wiki/MPEG_LA#HEVC_licensors>historically had a thing for</a> (they're working on a <a href=https://lists.ffmpeg.org/pipermail/ffmpeg-trac/2023-September/067234.html>HEVC Stereo extension</a> as of late 2023) &mdash; and then three more codecs were chosen to add to the block; we know the last two of the three were H.264 then VP9. <em>Maybe</em> H.263/MPEG-4 Part 2.</p><p>Our final register definitions, short and sweet.</p><pre><code>#define AVD_VP_INSN_FIFO_265  0x1104004
+#define AVD_VP_INSN_FIFO_???  0x1104008  /* mystery codec */
+#define AVD_VP_INSN_FIFO_264  0x110400c
+#define AVD_VP_INSN_FIFO_VP9  0x1104010
+
+#define AVD_PP_DECODE_CTRL    0x1104014
+#define AVD_PP_DECODE_STATUS  0x1104060
+
+#define AVD_VP_INSN_FIFO_IOVA 0x1104068  /* 6 slots up to 0x1104080 */
+#define AVD_VP_INSN_FIFO_MASK 0x1104084  /* 6 slots up to 0x110409c */
+#define AVD_VP_INSN_FIFO_CACH 0x11040a0  /* 6 slots up to 0x11040b8 */
+#define AVD_VP_INSN_FIFO_XFER 0x11040bc  /* 6 slots up to 0x11040d4 */
+</code></pre><p>And driver code, also short and sweet. You can check the full version in my WIP <a href=https://github.com/eiln/m1n1/tree/avd>m1n1 development branch</a>.</p><pre style=max-height:1000px><code>set_raw_payload(ctx)  # upload RBSP + prob blob if applicable
+
+avd_w32(AVD_VP_INSN_FIFO_IOVA + (ctx.insn_fifo_idx * 0x4), ctx.insn_fifo_iova >> 8)
+avd_w32(AVD_VP_INSN_FIFO_MASK + (ctx.insn_fifo_idx * 0x4), 0x100000)  # enable
+avd_w32(AVD_VP_INSN_FIFO_CACH + (ctx.insn_fifo_idx * 0x4), 0x0)  # reset counter
+avd_w32(AVD_VP_INSN_FIFO_XFER + (ctx.insn_fifo_idx * 0x4), 0x0)  # reset counter
+
+insn_stream = gen_vp_insn_stream(ctx)
+for x in insn_stream:
+	if   (mode == "h265"):
+		avd_w32(AVD_VP_INSN_FIFO_265, x)
+	elif (mode == "h264"):
+		avd_w32(AVD_VP_INSN_FIFO_264, x)
+	elif (mode == "vp09"):
+		avd_w32(AVD_VP_INSN_FIFO_VP9, x)
+# PP instruction stream DMA'd at insn_fifo_iova now; can flush RBSP
+# ideally we'd check by reading AVD_VP_INSN_FIFO_CACH/XFER counters
+
+avd_w32(AVD_PP_DECODE_CTRL, 0x2b000100 | (ctx.insn_fifo_idx * 0x10) | 7)  # magic
+while true:
+    status = avd_r32(AVD_PP_DECODE_STATUS)
+    if (status & 0xc00000 == 0xc00000):
+        break
+avd_w32(AVD_PP_DECODE_STATUS, 0x1000)
+</code></pre><p>It's basically a done problem if we figure out the instruction stream.</p><h2 id=opcodes>Opcodes</h2><p>AVD has the tiniest little custom instruction set specialized for decoding video. When VP processes a u32, if the value has the two upper bits set and unset respectively, it will execute the opcode function stored in the next 8 bits. Otherwise, it will pass-through like deadbeef did.</p><pre><code>| opcode |
+1011111111000000
+| | func |
+</code></pre><p>It'll make sense in hex. Here's all of H.264's opcodes:</p><h4 id=0x2a000000-set-macroblock-dimensions><code>0x2a000000</code>: Set macroblock dimensions</h4><pre><code>push(0x2a000000 | ((ctx.height - 1) &gt;&gt; 4) &lt;&lt; 12 | (ctx.width - 1) &gt;&gt; 4)
+</code></pre><h4 id=0x2b000000-execute-instruction-fifo><code>0x2b000000</code>: Execute instruction FIFO</h4><pre><code>push(0x2b000000 | 0x100 | ctx.inst_fifo_idx * 0x10)  # start; init cache &amp; reset state
+push(0x2b000000 | 0x400 | ctx.inst_fifo_idx * 0x10)  # end; DMA state
+</code></pre><h4 id=0x2c000000-execute-macroblock-parser><code>0x2c000000</code>: Execute macroblock parser</h4><pre><code># push(0x2d800000)
+# push(ctx.coded_slice_addr + sl.header_size)
+# push(ctx.coded_slice_size - sl.header_size)
+push(0x2c000000)
+</code></pre><h4 id=0x2d000000-set-slice-type-and-reference-count><code>0x2d000000</code>: Set slice type and reference count</h4><pre style=max-height:600px><code>x = 0
+if   (sl.slice_type == H264_SLICE_TYPE_I):
+	x |= 0x20000
+elif (sl.slice_type == H264_SLICE_TYPE_P):
+	x |= 0x10000
+elif (sl.slice_type == H264_SLICE_TYPE_B):
+	x |= 0x40000
+if ((sl.slice_type == H264_SLICE_TYPE_P) or (sl.slice_type == H264_SLICE_TYPE_B)):
+	if (sl.num_ref_idx_active_override_flag != 0):
+		x |= sl.num_ref_idx_l0_active_minus1 << 11
+		if (sl.slice_type == H264_SLICE_TYPE_B):
+			x |= sl.num_ref_idx_l1_active_minus1 << 7
+	else:
+		x |= 0x1000
+push(0x2d000000 | x)
+</code></pre><h4 id=0x2d800000-set-macroblock-source-addresssize><code>0x2d800000</code>: Set macroblock source address/size</h4><pre><code>push(0x2d800000)
+push(ctx.coded_slice_addr + sl.header_size)
+push(ctx.coded_slice_size - sl.header_size)
+# push(0x2dc00000)
+</code></pre><p>VP9 is tiled so the above adapts pretty much as you'd expect it to.</p><pre><code>for i,tile in enumerate(sl.tiles):
+	push(0x2d800000)  # set tile source address/size
+	push(ctx.coded_slice_addr + tile.offset)
+	push(tile.size)
+
+	push(0x2a000000 | i * 4)  # set tile index then tile row/col
+	push(i &lt;&lt; 24 | ((tile.row + 1) * 8 - 1) &lt;&lt; 12 | ((tile.col + 1) * 4 - 1))
+
+	if (i &lt; len(sl.tiles) - 1):
+		x = 0xfff000  # tile mask
+	else:
+		x = 0x000400  # end
+	push(0x2b000000 | x)
+</code></pre><h4 id=0x2d900000-set-quantization-params><code>0x2d900000</code>: Set quantization params</h4><pre><code>push(0x2d900000 | (26 + pps.pic_init_qp_minus26 + sl.slice_qp_delta) * 0x400)
+</code></pre><h4 id=0x2da00000-something-mv-constant><code>0x2da00000</code>: Something MV; constant</h4><pre><code>push(0x2da00000 | 0x30000)
+</code></pre><h4 id=0x2db00000-signal-start-of-header><code>0x2db00000</code>: Signal start of header</h4><pre><code>x = 0x12e0
+if (sl.nal_unit_type == H264_NAL_SLICE_IDR): # intra
+	x |= 0x2000
+push(0x2db00000 | x)
+</code></pre><h4 id=0x2dc00000-set-reference-frames><code>0x2dc00000</code>: Set reference frames</h4><pre><code>if (sl.slice_type == H264_SLICE_TYPE_P) or (sl.slice_type == H264_SLICE_TYPE_B):
+	lx = 0
+	for i,lst in enumerate(sl.pic.list0):
+		pos = list([x.pic_num for x in ctx.dpb_list]).index(lst.pic_num)
+		push(0x2dc00000 | lx &lt;&lt; 8 | i &lt;&lt; 4 | pos)
+	if (sl.slice_type == H264_SLICE_TYPE_B):
+		lx = 1
+		for i,lst in enumerate(sl.pic.list1):
+			pos = list([x.pic_num for x in ctx.dpb_list]).index(lst.pic_num)
+			push(0x2dc00000 | lx &lt;&lt; 8 | i &lt;&lt; 4 | pos)
+</code></pre><h4 id=0x2dd00000-set-prediction-weights-denom><code>0x2dd00000</code>: Set prediction weights denom</h4><pre><code>if (sl.slice_type == H264_SLICE_TYPE_P) or (sl.slice_type == H264_SLICE_TYPE_B):
+	if (sl.slice_type == H264_SLICE_TYPE_P):
+		x = 0x40
+	else:
+		x = 0xad
+	if ((pps.weighted_pred_flag &amp;&amp; sl.slice_type_nos == H264_SLICE_TYPE_P) ||
+		(pps.weighted_bipred_idc == 1 &amp;&amp; sl.slice_type == H264_SLICE_TYPE_B)):
+		x |= (sl.luma_log2_weight_denom &lt;&lt; 3) | sl.chroma_log2_weight_denom
+	push(0x2dd00000 | x)
+</code></pre><h4 id=0x2de00000-set-prediction-weights><code>0x2de00000</code>: Set prediction weights</h4><h4 id=0x2df00000-set-prediction-weights-offsets><code>0x2df00000</code>: Set prediction weights offsets</h4><pre><code># if (pps.weighted_pred_flag...)
+for i in range(sl.num_ref_idx_l0_active_minus1 + 1):
+	if (sl.luma_weight_l0_flag[i]):
+		push(0x2de00000 | (0 + 1) * 0x4000 | i * 0x200 | sl.luma_weight_l0[i])
+		push(0x2df00000 | swrap(sl.luma_offset_l0[i], 0x10000))
+	if (sl.chroma_weight_l0_flag[i]):
+		push(0x2de00000 | (1 + 1) * 0x4000 | i * 0x200 | sl.chroma_weight_l0[i][0])
+		push(0x2df00000 | swrap(sl.chroma_offset_l0[i][0], 0x10000))
+		push(0x2de00000 | (2 + 1) * 0x4000 | i * 0x200 | sl.chroma_weight_l0[i][1])
+		push(0x2df00000 | swrap(sl.chroma_offset_l0[i][1], 0x10000))
+/* Repeat for L1 */
+</code></pre><h4 id=0x2f000000-set-transform-coefficients><code>0x2f000000</code>: Set transform coefficients</h4><pre><code>push(0x2f000000 | swrap(x, 0x80000))
+</code></pre><p>We'll revisit this one in a bit.</p><p><strong>H.264</strong></p><table><thead><tr><th>Opcode</th><th>Description</th></tr></thead><tbody><tr><td>0x2a000000</td><td>Set macroblock dimensions</td></tr><tr><td>0x2b000000</td><td>Execute instruction FIFO</td></tr><tr><td>0x2c000000</td><td>Execute macroblock parser</td></tr><tr><td>0x2d000000</td><td>Set slice type and reference count</td></tr><tr><td>0x2d800000</td><td>Set macroblock source address/size</td></tr><tr><td>0x2d900000</td><td>Set quantization params</td></tr><tr><td>0x2da00000</td><td>Something MV; constant</td></tr><tr><td>0x2db00000</td><td>Signal start of header</td></tr><tr><td>0x2dc00000</td><td>Set reference frames</td></tr><tr><td>0x2dd00000</td><td>Set prediction weights denom</td></tr><tr><td>0x2de00000</td><td>Set prediction weights</td></tr><tr><td>0x2df00000</td><td>Set prediction weights offsets</td></tr><tr><td>0x2f000000</td><td>Set transform coefficients</td></tr></tbody></table><p><strong>VP9</strong></p><table><thead><tr><th>Opcode</th><th>Description</th></tr></thead><tbody><tr><td>0x2a000000</td><td>Set tile index and tile row/col</td></tr><tr><td>0x2b000000</td><td>Execute instruction FIFO</td></tr><tr><td>0x2c000000</td><td>Execute macroblock parser</td></tr><tr><td>0x2d800000</td><td>Set macroblock source address/size</td></tr><tr><td>0x2db00000</td><td>Signal start of header</td></tr><tr><td>0x2f000000</td><td>Set transform coefficients</td></tr></tbody></table><h2 id=vppp>VP/PP</h2><p>What doesn't get executed (the upper header part) simply passes-through to be DMA'd over to IOMMU space. What's happening here is that the words passed-through are the PP instructions that we generate. They are intended to be executed by PP, it's just not VP-exectuable. What we input into VP is actually the full PP instruction stream with chunks of VP executable-code that is intended to be executed by VP and replaced with the VP generated (PP) code, thus completing the full PP instruction stream. VP has no knowledge that what's not an opcode is intended for PP, and, in turn, the first part has no effect on VP's codegen. It's all quite meta. Below is an IOMMU snapshot of VP output / PP input.</p><pre style=max-height:600px><code>00004040: 00010780 000107fa 000107d2 000073c1 00000008 000073e1 00000008 00000000
+00004060: 003f007f 04020002 000082c0 000075c0 00070007 00070007 00070007 00070007
+00004080: 11000004 0000e6d0 0000e680 0000e6fa 0000e6d2 11000002 000106d0 <span class=clr-bg-pink>00010680</span>
+000040a0: <span class=clr-bg-pink>000106fa 000106d2 00000000</span> <span class=clr-bg-purple>2d904000 2da30000 2dc00001 2dc00011 2dc00020</span>
+000040c0: <span class=clr-bg-purple>2dd00040 2de04201 2df0ffff 2a000000 00003007 2d011000</span> <span class=clr-bg-green>01000000 020c0000</span>
+000040e0: <span class=clr-bg-blue>2f080001 </span><span class=clr-bg-green>0c000001 2f000001 0c000000 00800000 01001001 0200ff00 050f0000</span>
+</code></pre><p>The VP output stream starts out pretty much the same as the VP input, which is expected because none of them were opcodes. But it gets pretty unrecognizable towards the end, exactly where the VP opcodes start. Below is the relevant chunk from the VP input stream. Index [49]-[52] deals with the macroblock coded slice address and macroblock coded slice size; that sounds important. Oddly enough, that section is nowhere to be found in the IOMMU snapshot above. Instead it's replaced by a new, much longer (it's cut off) blob which includes some opcode we never directly used, <code>0x2f000000</code>.</p><pre style=max-height:600px><code>[45] <span class=clr-bg-pink>   0x10680</span> | hdr_150_ref1_addr_lsb7[1]
+[46] <span class=clr-bg-pink>   0x106fa</span> | hdr_190_ref2_addr_lsb7[1]
+[47] <span class=clr-bg-pink>   0x106d2</span> | hdr_1d0_ref3_addr_lsb7[1]
+[48] <span class=clr-bg-pink>       0x0</span> | unk_48
+[49] <span class=clr-bg-red>0x2d800000</span> | <span class=clr-bg-red>slc_a7c_cmd_d8</span>            /* Set macroblock source address/size */
+[50] <span class=clr-bg-red>  0x74400d</span> | <span class=clr-bg-red>inp_8b4d4_slice_addr_low</span>  /* push(coded_slice_addr + header_size) */
+[51] <span class=clr-bg-red>      0x36</span> | <span class=clr-bg-red>inp_8b4d8_slice_hdr_size</span>  /* push(coded_slice_size - header_size) */
+[52] <span class=clr-bg-red>0x2c000000</span> | <span class=clr-bg-red>cm3_cmd_exec_vp_mb</span>        /* Execute macroblock parser */
+[53] <span class=clr-bg-purple>0x2d904000</span> | slc_a70_cmd_slice_qpy
+[54] <span class=clr-bg-purple>0x2da30000</span> | slc_a74_cmd_a3
+[55] <span class=clr-bg-purple>0x2dc00001</span> | slc_6e8_cmd_ref_list_0[0]
+[56] <span class=clr-bg-purple>0x2dc00011</span> | slc_6e8_cmd_ref_list_0[1]
+</code></pre><p>Video codecs very roughly work by operating on the difference of the current frame against nearby frames called reference frames. That's already compression, but we could do better. The <em>residual</em>, having a lot of zeros, can further be (losslessly) compressed, usually via some method of entropy-coding; H.264/5 uses the CABAC (or the older CAVLC method), HEVC is CABAC-only I believe, whereas VP9 uses a completely different Huffman tree probability model introduced in <a href=https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/37073.pdf>VP8</a>; not to mention the syntax in which they are stored obviously differs per codec &mdash; sounds like a normalization job for the VPs. Indeed, VPs embed an entropy unit (e.g. H.264 VP reads <code>entropy_coding_mode_flag</code> and determines CABAC vs. CAVLC, then does CABAC/CAVLC), syntax unit for deriving transform coefficients + motion vectors from those, inverse quantization unit, and then a final codegen unit which compiles the parsed data into a form understood by PP.</p><pre><code>         Y_DC -1280
+00004180: 2f080500 0c000005 300681d3 0c000005 30038a59 00800000 01000003 02041000
+                                    Y_DC -1280        U_DC 480          V_DC -1428
+000041a0: 0508a000 10408000 0c000001 2f080500 0c000001 2f0001e0 0c000001 2f080594
+                                                               Y_DC 3328
+000041c0: 00800000 01000004 02041000 0508a000 10408000 0c000001 2f000d00 0c000001
+         U_DC -2861        V_DC 455
+000041e0: 2f080b2d 0c000001 2f0001c7 00800000 01000005 02041000 0508a000 10818204
+</code></pre><p>Stream index [49]-[52], which encodes the start of the macroblock bitstream (or the bitstream offsetted by header size) and the size of the macroblock bitstream (total size - header size), effectively <em>expandeds</em> into the <span class=clr-bg-green>PP macroblock IR</span>. Considering you can, at this point, completely remove the coded slice and PP will still do its thing, there's obviously much more to the MB IR than just the DC coefficients annotated above; it's actually really long and complex and I don't fully understand it (of course, we don't need to understand it to decode our frames; that's the point, it does it for us). It's literally machine-generated code, it's not meant for human consumption. There's specific data structures within that are much more recognizable e.g. here's the motion vectors for some frame (courtesy of ffmpeg docs/examples/extract_mvs.c), and what VP emits.</p><table><thead><tr><th>idx</th><th>source</th><th>blockw</th><th>blockh</th><th>srcx</th><th>srcy</th><th>dstx</th><th>dsty</th><th>motion_x</th><th>motion_y</th></tr></thead><tbody><tr><td>20</td><td>-1</td><td>8</td><td>16</td><td>18</td><td>40</td><td>20</td><td>40</td><td>-10</td><td>0</td></tr><tr><td>21</td><td>-1</td><td>8</td><td>16</td><td>27</td><td>40</td><td>28</td><td>40</td><td>-7</td><td>0</td></tr><tr><td>22</td><td>-1</td><td>16</td><td>8</td><td>39</td><td>36</td><td>40</td><td>36</td><td>-7</td><td>0</td></tr><tr><td>23</td><td>-1</td><td>16</td><td>8</td><td>41</td><td>44</td><td>40</td><td>44</td><td>5</td><td>0</td></tr><tr><td>24</td><td>-1</td><td>16</td><td>16</td><td>56</td><td>40</td><td>56</td><td>40</td><td>-3</td><td>0</td></tr></tbody></table><pre><code>0075c440: <span class=clr-bg-red>80003ff6 00003ff6 08003ff6 00003ff6 </span><span class=clr-bg-orange>00003ff9 00003ff9 08003ff9 00003ff9</span>
+0075c460: <span class=clr-bg-red>00003ff6 00003ff6 08003ff6 00003ff6 </span><span class=clr-bg-orange>00003ff9 00003ff9 08003ff9 00003ff9</span>
+0075c480: <span class=clr-bg-green>80003ff9 00003ff9 08003ff9 00003ff9 00003ff9 00003ff9 08003ff9 00003ff9</span>
+0075c4a0: <span class=clr-bg-blue>00000005 00000005 08000005 00000005 00000005 00000005 08000005 00000005</span>
+0075c4c0: <span class=clr-bg-purple>80003ffd 00003ffd 08003ffd 00003ffd 00003ffd 00003ffd 08003ffd 00003ffd</span>
+0075c4e0: <span class=clr-bg-purple>00003ffd 00003ffd 08003ffd 00003ffd 00003ffd 00003ffd 08003ffd 00003ffd</span>
+</code></pre><p>The 8x8 up to 16x16 block storage scheme should be pretty obvious, and from that we can tell the motion_x component is stored in the last 14 bits, sign-wrapped at 0x4000. As for the motion_y component, here's a neat example I found in the wild:</p><table><thead><tr><th>idx</th><th>source</th><th>blockw</th><th>blockh</th><th>srcx</th><th>srcy</th><th>dstx</th><th>dsty</th><th>motion_x</th><th>motion_y</th></tr></thead><tbody><tr><td>17</td><td>-1</td><td>8</td><td>8</td><td>1</td><td>36</td><td>4</td><td>36</td><td>-14</td><td>2</td></tr><tr><td>18</td><td>-1</td><td>8</td><td>8</td><td>9</td><td>36</td><td>12</td><td>36</td><td>-14</td><td>1</td></tr><tr><td>19</td><td>-1</td><td>8</td><td>8</td><td>1</td><td>42</td><td>4</td><td>44</td><td>-14</td><td>-8</td></tr><tr><td>20</td><td>-1</td><td>8</td><td>8</td><td>9</td><td>44</td><td>12</td><td>44</td><td>-14</td><td>0</td></tr></tbody></table><pre><code>0077c400: <span class=clr-bg-red>8000bff2 0000bff2 0800bff2 0000bff2 </span><span class=clr-bg-orange>00007ff2 00007ff2 08007ff2 00007ff2</span>
+0077c420: <span class=clr-bg-green>43fe3ff2 03fe3ff2 13fe3ff2 03fe3ff2 </span></span><span class=clr-bg-blue>00003ff2 00003ff2 08003ff2 00003ff2</span>
+</code></pre><pre><code>swrap((motion_y * 4), 0x4000) &lt;&lt; 12 | swrap(motion_x, 0x4000)
+</code></pre><p>Note that H.264's VP can do CAVLC/CABAC, but, to my surprise, VP9's VP can neither decode the arithmetically-coded compressed header nor do the per-frame (post) adaptive merge process; we have to do it ourselves and upload a separate probabilities blob for each frame. The "prob blob" is a <a href=https://github.com/eiln/avd/blob/main/avid/vp9/probs.py>very lovely struct</a> I had to RE. From the uploaded "prob blob" VP9's VP can derive the coefs/mvs. And, of course, PP will never see the prob blob (this might come useful once we get consider performance/memory usage when writing a proper driver, probably the next writeup). As for the other, straightforward parts of the PP instruction stream, read the <a href=https://github.com/eiln/avd>source code</a> :).</p><div class=footnotes role=doc-endnotes><hr><ol><li id=fn:1><p>VP2 video decoding. Envytools documentation. <a href=https://envytools.readthedocs.io/en/latest/hw/vdec/vp2/vld.html>https://envytools.readthedocs.io/en/latest/hw/vdec/vp2/vld.html</a>&#160;<a href=#fnref:1 class=footnote-backref role=doc-backlink>&#8617;&#xfe0e;</a></p></li><li id=fn:2><ul><li>APR: Apple ProRes Encoder/Decoder</li><li>CSC: Apple Colorspace Converter and Scaler</li><li>JPG: <del>Shikino</del> Apple JPEG Encoder/Decoder</li><li>AVE: Apple Video Encoder (H.264/H.265)</li><li>ANE: Apple Neural Engine (FP16 convolver)</li><li>ISP: Apple Image Signal Processor (camera DSP block)</li></ul>&#160;<a href=#fnref:2 class=footnote-backref role=doc-backlink>&#8617;&#xfe0e;</a></li><li id=fn:3><p>Creative Use of GPU Fixed-Function Hardware. <a href=https://asawicki.info/news_1745_creative_use_of_gpu_fixed-function_hardware>https://asawicki.info/news_1745_creative_use_of_gpu_fixed-function_hardware</a>&#160;<a href=#fnref:3 class=footnote-backref role=doc-backlink>&#8617;&#xfe0e;</a></p></li><li id=fn:4><p>H.264: Advanced video coding for generic audiovisual services. Recommendation H.264 (05/03). 7.3.3.2, Prediction weight table syntax. <a href=https://www.itu.int/rec/T-REC-H.264-200305-S/en>https://www.itu.int/rec/T-REC-H.264-200305-S/en</a>&#160;<a href=#fnref:4 class=footnote-backref role=doc-backlink>&#8617;&#xfe0e;</a></p></li></ol></div><div class=footer></div></body></html>
